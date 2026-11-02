@@ -1,0 +1,19 @@
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=API_KEY)
+history = [{"role": "system", "content": "Bạn là trợ lý hữu ích, trả lời bằng tiếng Việt."}]
+print("Gõ 'exit' để thoát, 'reset' để xóa lịch sử.\n")
+
+while True:
+    u = input("Bạn: ").strip()
+    if u.lower() in ("exit", "quit"): break
+    if u.lower() == "reset": history = history[:1]; print("Đã xóa.\n"); continue
+    if not u: continue
+    history.append({"role": "user", "content": u})
+    print("Qwen: ", end="", flush=True); reply = ""
+    for ch in client.chat.completions.create(
+            model="qwen", messages=history, max_tokens=2048, stream=True,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}}):
+        d = ch.choices[0].delta
+        if d.content: print(d.content, end="", flush=True); reply += d.content
+    print("\n"); history.append({"role": "assistant", "content": reply})
