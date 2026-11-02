@@ -1,0 +1,128 @@
+import os, re, glob, time, secrets, subprocess, tarfile, requests
+from huggingface_hub import hf_hub_download, list_repo_files
+
+# ===================== CẤU HÌNH =====================
+MODEL_REPO = "unsloth/Qwen3.6-27B-GGUF"
+QUANT      = "Q4_K_M"
+CTX        = 8192          # giảm xuống 4096 nếu thiếu VRAM
+PORT       = 8080
+CHAT_IN_NOTEBOOK = False   # True = chat ngay trong notebook sau khi xong
+TMP        = "/kaggle/temp"
+# ====================================================
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+# 0. Kiểm tra GPU
+gpus = sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader").stdout.strip().splitlines()
+print("GPU:", gpus)
+assert len(gpus) >= 2, "Cần 2 GPU: Settings -> Accelerator -> GPU T4 x2"
+
+# 0b. HF token (tuỳ chọn, tải nhanh hơn). Thêm secret tên HF_TOKEN trong Add-ons -> Secrets
+try:
+    from kaggle_secrets import UserSecretsClient
+    os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+    print("Đã dùng HF_TOKEN")
+except Exception:
+    print("Không có HF_TOKEN (bỏ qua, vẫn chạy bình thường)")
+
+# 1. Dừng tiến trình cũ nếu có
+sh("pkill -f llama-server; pkill -f cloudflared"); time.sleep(2)
+
+# 2. Engine llama.cpp dựng sẵn cho T4
+BIN_DIR = f"{TMP}/llama-bin"
+found = glob.glob(f"{BIN_DIR}/**/llama-server", recursive=True)
+if not found:
+    print("Tải engine...")
+    tgz = hf_hub_download("tchbcb/nqwen27", "engine/llama-b11175-cu128-sm75-t4.tar.gz", local_dir=TMP)
+    os.makedirs(BIN_DIR, exist_ok=True)
+    with tarfile.open(tgz) as t:
+        t.extractall(BIN_DIR)
+    found = glob.glob(f"{BIN_DIR}/**/llama-server", recursive=True)
+assert found, "Không tìm thấy llama-server"
+SERVER_BIN = found[0]
+os.chmod(SERVER_BIN, 0o755)
+print("Engine:", SERVER_BIN)
+
+# 3. Model GGUF
+files = [f for f in list_repo_files(MODEL_REPO)
+         if f.endswith(".gguf") and QUANT in f and "mmproj" not in f.lower()]
+assert files, f"Repo không có bản {QUANT}"
+print("Tải model (lần đầu mất vài phút):", files[0])
+MODEL_PATH = hf_hub_download(MODEL_REPO, files[0], local_dir=TMP)
+print("Model:", MODEL_PATH)
+
+# 4. Chạy server (có API key)
+API_KEY = "sk-" + secrets.token_urlsafe(24)
+env = dict(os.environ)
+bd = os.path.dirname(SERVER_BIN)
+env["LD_LIBRARY_PATH"] = f"{bd}:{os.path.dirname(bd)}/lib:{BIN_DIR}/lib:" + env.get("LD_LIBRARY_PATH", "")
+server = subprocess.Popen([
+    SERVER_BIN, "-m", MODEL_PATH,
+    "-ngl", "99", "--tensor-split", "1,1", "-c", str(CTX),
+    "--host", "127.0.0.1", "--port", str(PORT),
+    "--api-key", API_KEY,
+], env=env, stdout=open(f"{TMP}/server.log", "w"), stderr=subprocess.STDOUT)
+
+print("Đang nạp model lên GPU...")
+ok = False
+for _ in range(120):
+    if server.poll() is not None:
+        print("Server thoát, log:\n", open(f"{TMP}/server.log").read()[-2500:]); break
+    try:
+        if requests.get(f"http://127.0.0.1:{PORT}/health", timeout=3).status_code == 200:
+            ok = True; break
+    except Exception:
+        pass
+    time.sleep(5)
+assert ok, "Server chưa lên, xem /kaggle/temp/server.log"
+print("Server sẵn sàng")
+
+# 5. Cloudflare Quick Tunnel (không cần đăng nhập)
+CF = f"{TMP}/cloudflared"
+if not os.path.exists(CF):
+    sh(f"wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O {CF}")
+os.chmod(CF, 0o755)
+tunnel = subprocess.Popen([CF, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
+                          stdout=open(f"{TMP}/tunnel.log", "w"), stderr=subprocess.STDOUT)
+PUBLIC_URL = None
+for _ in range(45):
+    m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", open(f"{TMP}/tunnel.log").read())
+    if m:
+        PUBLIC_URL = m.group(0); break
+    time.sleep(2)
+assert PUBLIC_URL, "Không lấy được URL tunnel:\n" + open(f"{TMP}/tunnel.log").read()[-1500:]
+
+# 6. In thông tin
+print("\n" + "=" * 60)
+print("BASE URL :", PUBLIC_URL + "/v1")
+print("API KEY  :", API_KEY)
+print("MODEL    : qwen   (tên bất kỳ cũng được)")
+print("=" * 60)
+print(f"""\nTest từ máy bạn:
+curl {PUBLIC_URL}/v1/chat/completions \\
+  -H "Authorization: Bearer {API_KEY}" -H "Content-Type: application/json" \\
+  -d '{{"model":"qwen","messages":[{{"role":"user","content":"Xin chào"}}],"max_tokens":256}}'
+""")
+print("Dừng mọi thứ: tunnel.terminate(); server.terminate()")
+
+# 7. Chat trong notebook (tuỳ chọn)
+if CHAT_IN_NOTEBOOK:
+    sh("pip -q install openai")
+    from openai import OpenAI
+    client = OpenAI(base_url=f"http://127.0.0.1:{PORT}/v1", api_key=API_KEY)
+    history = [{"role": "system", "content": "Bạn là trợ lý hữu ích, trả lời bằng tiếng Việt."}]
+    print("\nChat: gõ 'exit' để thoát, 'reset' để xóa lịch sử.\n")
+    while True:
+        u = input("Bạn: ").strip()
+        if u.lower() in ("exit", "quit"): break
+        if u.lower() == "reset": history = history[:1]; print("Đã xóa.\n"); continue
+        if not u: continue
+        history.append({"role": "user", "content": u})
+        print("Qwen: ", end="", flush=True); reply = ""
+        for ch in client.chat.completions.create(
+                model="qwen", messages=history, max_tokens=2048, stream=True,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}):
+            d = ch.choices[0].delta
+            if d.content: print(d.content, end="", flush=True); reply += d.content
+        print("\n"); history.append({"role": "assistant", "content": reply})
